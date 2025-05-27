@@ -12,9 +12,9 @@ import { ILimitedStakeRewardReceiver } from "./interfaces/ILimitedStakeRewardRec
 ///  more information that can be found here: https://www.halborn.com/blog/post/what-is-timestamp-dependence
 contract LimitedStakeRewardReceiver is ILimitedStakeRewardReceiver {
     /// @notice The hashed beneficiary address
-    bytes32 public constant BENEFICIARY = 0x85bb944aad1ac797ba6ab0cd69e14a9084d2edae32fdab7fbf5e21c3869bf862; // TODO: update to the actual value
+    bytes32 public constant BENEFICIARY = 0x8db6ec5b3d82a244eabfda6181bd25b3f6975b4dac11bdc43979fd7f4baed342; // TODO: update to the actual value
     /// @notice The treasury address
-    address public constant TREASURY = 0x812F55260F600bEC25A74811A7CB8D11Fe74299C; // TODO: update to the actual value
+    address public constant TREASURY = 0xb150dfd9539eDB8e0B19caA5ca37cf85Df487cC0; // TODO: update to the actual value
     /// @notice The unlock timestamp
     uint256 public constant UNLOCK_TIMESTAMP = 1767446400; // TODO: update to the actual value
     /// @notice The pre-unlock time maximum claimable rewards limit

@@ -21,7 +21,7 @@ contract LimitedStakeRewardReceiverTest is Test {
         limitedStakeRewardReceiver = new LimitedStakeRewardReceiver();
         stakingContract = IIPTokenStaking(address(0xCCcCcC0000000000000000000000000000000001));
 
-        beneficiary = 0x0aD06C3639E7Ef9F77c2b7057F5Ddf7A49949C6D;
+        beneficiary = 0xAa43aC49d67670477f998010e2DAEeDCb2c38fF7;
         bytes32 beneficiaryHash = keccak256(abi.encodePacked(beneficiary));
         // console2.logBytes32(beneficiaryHash);
         assertEq(limitedStakeRewardReceiver.BENEFICIARY(), beneficiaryHash);
