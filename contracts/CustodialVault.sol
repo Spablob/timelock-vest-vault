@@ -97,6 +97,7 @@ contract CustodialVault is ReentrancyGuardTransient {
     error InvalidThreshold();
     error ProposalAlreadyActive();
     error NoActiveProposal();
+    error InvalidPriceHistory();
 
     constructor(
         address _foundation,
@@ -171,6 +172,9 @@ contract CustodialVault is ReentrancyGuardTransient {
             if (priceHistoryLength < MAX_PRICE_POINTS) {
                 revert InsufficientPriceHistory();
             }
+            
+            // Validate price history integrity
+            _validatePriceHistory();
 
             // Check if price has dropped by the threshold amount or more
             if (currentPrice >= initialPrice) revert PriceDropThresholdNotMet();
@@ -305,6 +309,55 @@ contract CustodialVault is ReentrancyGuardTransient {
         }
 
         return weightedSum / totalWeight;
+    }
+
+    /// @notice Validates price history integrity
+    /// @dev Ensures all entries are within 24 hours and chronologically ordered
+    function _validatePriceHistory() internal view {
+        uint256 cutoffTime = block.timestamp > TWAP_WINDOW ? block.timestamp - TWAP_WINDOW : 0;
+        uint256 previousTimestamp = 0;
+        uint256 oldestValidTimestamp = block.timestamp;
+        
+        // Get the most recent index (one before current write position)
+        uint256 readIndex = priceHistoryIndex > 0 ? priceHistoryIndex - 1 : MAX_PRICE_POINTS - 1;
+        
+        // Check all entries in the ring buffer
+        for (uint256 i = 0; i < MAX_PRICE_POINTS && i < priceHistoryLength; i++) {
+            PricePoint memory point = priceHistory[readIndex];
+            
+            // Skip if we reach uninitialized entries
+            if (point.timestamp == 0) {
+                break;
+            }
+            
+            // Stop if entry is older than 24 hours
+            if (point.timestamp < cutoffTime) {
+                break;
+            }
+            
+            // First valid entry
+            if (previousTimestamp == 0) {
+                previousTimestamp = point.timestamp;
+            } else {
+                // Check chronological order (older entries should have lower timestamps)
+                if (point.timestamp >= previousTimestamp) {
+                    revert InvalidPriceHistory();
+                }
+                previousTimestamp = point.timestamp;
+            }
+            
+            // Track oldest valid timestamp
+            oldestValidTimestamp = point.timestamp;
+            
+            // Move to previous entry in ring buffer
+            readIndex = readIndex > 0 ? readIndex - 1 : MAX_PRICE_POINTS - 1;
+        }
+        
+        // Ensure we have close to 24 hours of data (allow 23.5 hours minimum)
+        uint256 timeSpan = block.timestamp - oldestValidTimestamp;
+        if (timeSpan < 23.5 hours) {
+            revert InvalidPriceHistory();
+        }
     }
 
     /// @notice Converts Pyth price format to 18 decimals

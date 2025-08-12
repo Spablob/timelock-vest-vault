@@ -30,6 +30,7 @@ function withdrawByLender() external nonReentrant
 **Review Points:**
 - ✅ All conditions are properly enforced with custom errors
 - ✅ Uses TWAP price, not spot price (manipulation resistant)
+- ✅ Validates price history integrity (chronological order, 23.5+ hours of data)
 - ✅ Transfers entire balance, no partial withdrawals
 - ✅ Emits event for transparency
 
@@ -54,7 +55,28 @@ function _getTWAPPrice() internal view returns (uint256)
 - ✅ Ring buffer prevents unbounded array growth
 - ✅ Handles all edge cases properly
 
-### 3. Price Update Mechanism
+### 3. `_validatePriceHistory()` - Price History Validation
+
+```solidity
+function _validatePriceHistory() internal view
+```
+
+**What it does:**
+- Validates that price history entries are in chronological order
+- Ensures we have at least 23.5 hours of price data
+- Prevents manipulation through invalid price sequences
+
+**Key Features:**
+- Checks all entries within the 24-hour window
+- Verifies timestamps decrease monotonically (going backwards in time)
+- Requires minimum time span to prevent insufficient data attacks
+
+**Review Points:**
+- ✅ Prevents out-of-order price manipulation
+- ✅ Ensures sufficient historical data for accurate TWAP
+- ✅ Only validates data within the TWAP window
+
+### 4. Price Update Mechanism
 
 ```solidity
 function refreshFeedsAndUpdatePrice(bytes[] calldata pythUpdateData) external payable

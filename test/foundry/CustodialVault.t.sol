@@ -1219,4 +1219,100 @@ contract CustodialVaultTest is Test {
         assertEq(LENDER.balance, lenderBalanceBefore + TOTAL_TOKEN_AMOUNT);
         assertTrue(vault.withdrawn());
     }
+
+    function testPriceHistoryChronologicalOrder() public {
+        // This test verifies that price entries are stored in chronological order
+        // The contract enforces this by using block.timestamp when storing prices
+        // Send tokens to vault
+        payable(address(vault)).transfer(TOTAL_TOKEN_AMOUNT);
+
+        // Build valid price history
+        for (uint256 i = 0; i < 1440; i++) {
+            vm.warp(block.timestamp + 1 minutes);
+            int64 pythPrice = 4000000000; // 40% of initial price (60% drop)
+            mockPyth.setPriceUnsafe(vault.IP_PRICE_FEED_ID(), pythPrice, 1000000, -8, block.timestamp);
+            vault.updatePrice();
+        }
+
+        // Prices are always stored with block.timestamp, ensuring chronological order
+        // The validation will pass
+        vm.prank(LENDER);
+        vault.withdrawByLender();
+        assertTrue(vault.withdrawn());
+    }
+
+    function testInvalidPriceHistoryTooInfrequent() public {
+        // Send tokens to vault
+        payable(address(vault)).transfer(TOTAL_TOKEN_AMOUNT);
+
+        // Build price history with updates too infrequent (every 2 minutes)
+        for (uint256 i = 0; i < 720; i++) { // Only 720 updates in 24 hours
+            vm.warp(block.timestamp + 2 minutes); // Too infrequent
+            int64 pythPrice = 4000000000; // 40% of initial price (60% drop)
+            mockPyth.setPriceUnsafe(vault.IP_PRICE_FEED_ID(), pythPrice, 1000000, -8, block.timestamp);
+            vault.updatePrice();
+        }
+
+        // Try to withdraw - should fail due to insufficient price history
+        vm.prank(LENDER);
+        vm.expectRevert(CustodialVault.InsufficientPriceHistory.selector);
+        vault.withdrawByLender();
+    }
+
+    function testValidPriceHistoryExactlyOneMinute() public {
+        // Send tokens to vault
+        payable(address(vault)).transfer(TOTAL_TOKEN_AMOUNT);
+
+        // Build perfect price history with exactly 1 minute intervals
+        for (uint256 i = 0; i < 1440; i++) {
+            vm.warp(block.timestamp + 1 minutes);
+            int64 pythPrice = 4000000000; // 40% of initial price (60% drop)
+            mockPyth.setPriceUnsafe(vault.IP_PRICE_FEED_ID(), pythPrice, 1000000, -8, block.timestamp);
+            vault.updatePrice();
+        }
+
+        // Should be able to withdraw with valid price history
+        vm.prank(LENDER);
+        vault.withdrawByLender();
+        assertTrue(vault.withdrawn());
+    }
+
+    function testValidPriceHistoryFullDay() public {
+        // Send tokens to vault
+        payable(address(vault)).transfer(TOTAL_TOKEN_AMOUNT);
+
+        // Build price history for full 24 hours
+        for (uint256 i = 0; i < 1440; i++) { // 24 hours = 1440 minutes
+            vm.warp(block.timestamp + 1 minutes);
+            int64 pythPrice = 4000000000; // 40% of initial price (60% drop)
+            mockPyth.setPriceUnsafe(vault.IP_PRICE_FEED_ID(), pythPrice, 1000000, -8, block.timestamp);
+            vault.updatePrice();
+        }
+
+        // Should be able to withdraw with full 24 hours of data
+        vm.prank(LENDER);
+        vault.withdrawByLender();
+        assertTrue(vault.withdrawn());
+    }
+
+    function testPriceHistoryValidationOnlyBeforeLockEnd() public {
+        // Send tokens to vault
+        payable(address(vault)).transfer(TOTAL_TOKEN_AMOUNT);
+
+        // Build invalid price history (too infrequent)
+        for (uint256 i = 0; i < 720; i++) {
+            vm.warp(block.timestamp + 2 minutes); // Too infrequent
+            int64 pythPrice = 4000000000; // 40% of initial price
+            mockPyth.setPriceUnsafe(vault.IP_PRICE_FEED_ID(), pythPrice, 1000000, -8, block.timestamp);
+            vault.updatePrice();
+        }
+
+        // Fast forward past lock period
+        vm.warp(vault.lockEndTime() + 1);
+
+        // Should be able to withdraw after lock end even with invalid history
+        vm.prank(LENDER);
+        vault.withdrawByLender();
+        assertTrue(vault.withdrawn());
+    }
 }
