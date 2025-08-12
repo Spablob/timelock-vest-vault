@@ -24,6 +24,7 @@ interface IPyth {
 ///         Anyone can transfer IP tokens to the vault
 ///         Foundation can withdraw after lock period with lender approval
 ///         Lender can withdraw before lock period if price drops by threshold (initially 50%, adjustable)
+///         Lender can withdraw after lock period without any restrictions
 ///         Foundation can propose to increase threshold with lender approval
 /// @dev Uses Pyth Oracle for price feeds and implements 24-hour TWAP for oracle manipulation protection
 contract CustodialVault is ReentrancyGuardTransient {
@@ -147,29 +148,36 @@ contract CustodialVault is ReentrancyGuardTransient {
         emit LenderApprovalGranted(lender);
     }
 
-    /// @notice Allows lender to withdraw all tokens if IP price has dropped by 50% or more
-    /// @dev Requires full 24 hours of price history (1440 data points) to ensure accurate TWAP calculation
-    /// @dev Call refreshFeedsAndUpdatePrice() first if you need to update the oracle price
+    /// @notice Allows lender to withdraw all tokens
+    /// @dev Before lock end: requires price drop >= threshold
+    /// @dev After lock end: no restrictions, can withdraw anytime
     function withdrawByLender() external nonReentrant {
         if (msg.sender != lender) revert NotAuthorized();
-        if (block.timestamp >= lockEndTime) revert LockPeriodExpired();
         if (withdrawn) revert AlreadyWithdrawn();
         
-        // Ensure price history is fresh (updated within PRICE_FRESHNESS_WINDOW)
-        if (block.timestamp - lastPriceUpdate > PRICE_FRESHNESS_WINDOW) revert StalePrice();
+        uint256 currentPrice = 0;
+        
+        // Different rules based on whether lock period has ended
+        if (block.timestamp < lockEndTime) {
+            // Before lock end: enforce price drop requirements
+            
+            // Ensure price history is fresh (updated within PRICE_FRESHNESS_WINDOW)
+            if (block.timestamp - lastPriceUpdate > PRICE_FRESHNESS_WINDOW) revert StalePrice();
 
-        // Get TWAP price
-        uint256 currentPrice = _getTWAPPrice();
+            // Get TWAP price
+            currentPrice = _getTWAPPrice();
 
-        // Check if we have sufficient price history (must have full 24 hours of data)
-        if (priceHistoryLength < MAX_PRICE_POINTS) {
-            revert InsufficientPriceHistory();
+            // Check if we have sufficient price history (must have full 24 hours of data)
+            if (priceHistoryLength < MAX_PRICE_POINTS) {
+                revert InsufficientPriceHistory();
+            }
+
+            // Check if price has dropped by the threshold amount or more
+            if (currentPrice >= initialPrice) revert PriceDropThresholdNotMet();
+            uint256 priceDropBps = ((initialPrice - currentPrice) * BASIS_POINTS) / initialPrice;
+            if (priceDropBps < priceDropThreshold) revert PriceDropThresholdNotMet();
         }
-
-        // Check if price has dropped by the threshold amount or more
-        if (currentPrice >= initialPrice) revert PriceDropThresholdNotMet();
-        uint256 priceDropBps = ((initialPrice - currentPrice) * BASIS_POINTS) / initialPrice;
-        if (priceDropBps < priceDropThreshold) revert PriceDropThresholdNotMet();
+        // After lock end: no restrictions, lender can withdraw freely
 
         withdrawn = true;
         uint256 amount = address(this).balance;

@@ -277,9 +277,16 @@ contract CustodialVaultTest is Test {
         // Fast forward past lock period
         vm.warp(vault.lockEndTime() + 1);
 
+        uint256 lenderBalanceBefore = LENDER.balance;
+
+        // Lender should be able to withdraw after lock end without restrictions
         vm.prank(LENDER);
-        vm.expectRevert(CustodialVault.LockPeriodExpired.selector);
+        vm.expectEmit(true, false, false, true);
+        emit TokensWithdrawnByLender(LENDER, TOTAL_TOKEN_AMOUNT, 0); // price is 0 for post-lock withdrawals
         vault.withdrawByLender();
+
+        assertEq(LENDER.balance, lenderBalanceBefore + TOTAL_TOKEN_AMOUNT);
+        assertTrue(vault.withdrawn());
     }
 
     function testWithdrawByLenderNotAuthorized() public {
@@ -1117,5 +1124,99 @@ contract CustodialVaultTest is Test {
         vm.prank(LENDER);
         vault.approveThresholdIncrease();
         assertEq(vault.priceDropThreshold(), 8000);
+    }
+
+    function testLenderWithdrawAfterLockEndNoPriceData() public {
+        // Send tokens to vault
+        payable(address(vault)).transfer(TOTAL_TOKEN_AMOUNT);
+
+        // Fast forward past lock period
+        vm.warp(vault.lockEndTime() + 1);
+
+        uint256 lenderBalanceBefore = LENDER.balance;
+
+        // Lender should be able to withdraw even without any price data
+        vm.prank(LENDER);
+        vault.withdrawByLender();
+
+        assertEq(LENDER.balance, lenderBalanceBefore + TOTAL_TOKEN_AMOUNT);
+        assertTrue(vault.withdrawn());
+    }
+
+    function testLenderWithdrawAfterLockEndWithHighPrice() public {
+        // Send tokens to vault
+        payable(address(vault)).transfer(TOTAL_TOKEN_AMOUNT);
+
+        // Set price higher than initial (price increase scenario)
+        int64 pythPrice = 15000000000; // 150% of initial price
+        mockPyth.setPriceUnsafe(vault.IP_PRICE_FEED_ID(), pythPrice, 1000000, -8, block.timestamp);
+        vault.updatePrice();
+
+        // Fast forward past lock period
+        vm.warp(vault.lockEndTime() + 1);
+
+        uint256 lenderBalanceBefore = LENDER.balance;
+
+        // Lender should be able to withdraw regardless of price
+        vm.prank(LENDER);
+        vault.withdrawByLender();
+
+        assertEq(LENDER.balance, lenderBalanceBefore + TOTAL_TOKEN_AMOUNT);
+        assertTrue(vault.withdrawn());
+    }
+
+    function testLenderVsFoundationPriority() public {
+        // Send tokens to vault
+        payable(address(vault)).transfer(TOTAL_TOKEN_AMOUNT);
+
+        // Fast forward past lock period
+        vm.warp(vault.lockEndTime() + 1);
+
+        // Lender hasn't approved foundation withdrawal
+        vm.prank(FOUNDATION);
+        vm.expectRevert(CustodialVault.LenderApprovalRequired.selector);
+        vault.withdrawByFoundation(RECIPIENT);
+
+        // But lender can still withdraw without approval
+        uint256 lenderBalanceBefore = LENDER.balance;
+        
+        vm.prank(LENDER);
+        vault.withdrawByLender();
+
+        assertEq(LENDER.balance, lenderBalanceBefore + TOTAL_TOKEN_AMOUNT);
+        assertTrue(vault.withdrawn());
+
+        // Foundation cannot withdraw after lender already withdrew
+        vm.prank(LENDER);
+        vault.approveFoundationWithdrawal(); // Even with approval
+
+        vm.prank(FOUNDATION);
+        vm.expectRevert(CustodialVault.AlreadyWithdrawn.selector);
+        vault.withdrawByFoundation(RECIPIENT);
+    }
+
+    function testLenderWithdrawAfterLockEndWithStalePrice() public {
+        // Send tokens to vault
+        payable(address(vault)).transfer(TOTAL_TOKEN_AMOUNT);
+
+        // Build some price history
+        for (uint256 i = 0; i < 10; i++) {
+            vm.warp(block.timestamp + 1 minutes);
+            int64 pythPrice = 10000000000; // Normal price
+            mockPyth.setPriceUnsafe(vault.IP_PRICE_FEED_ID(), pythPrice, 1000000, -8, block.timestamp);
+            vault.updatePrice();
+        }
+
+        // Fast forward past lock period (price becomes stale)
+        vm.warp(vault.lockEndTime() + 1);
+
+        uint256 lenderBalanceBefore = LENDER.balance;
+
+        // Lender should be able to withdraw even with stale price
+        vm.prank(LENDER);
+        vault.withdrawByLender();
+
+        assertEq(LENDER.balance, lenderBalanceBefore + TOTAL_TOKEN_AMOUNT);
+        assertTrue(vault.withdrawn());
     }
 }
