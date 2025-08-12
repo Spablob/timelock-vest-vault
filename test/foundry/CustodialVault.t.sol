@@ -33,6 +33,35 @@ contract MockPyth is IPyth {
     function getUpdateFee(bytes[] calldata) external pure override returns (uint256) {
         return 0.001 ether;
     }
+    
+    function parsePriceFeedUpdatesUnique(
+        bytes[] calldata,
+        bytes32[] calldata priceIds,
+        uint64 minPublishTime,
+        uint64
+    ) external payable override returns (IPyth.Price[] memory priceFeeds) {
+        priceFeeds = new IPyth.Price[](priceIds.length);
+        for (uint256 i = 0; i < priceIds.length; i++) {
+            if (priceSet[priceIds[i]]) {
+                // Return the stored price if it matches the time range
+                if (prices[priceIds[i]].publishTime >= minPublishTime) {
+                    priceFeeds[i] = prices[priceIds[i]];
+                } else {
+                    // Return a price with the requested timestamp
+                    priceFeeds[i] = IPyth.Price(
+                        prices[priceIds[i]].price,
+                        prices[priceIds[i]].conf,
+                        prices[priceIds[i]].expo,
+                        minPublishTime + 30 // Middle of the time range
+                    );
+                }
+            } else {
+                // Return default price with requested timestamp
+                priceFeeds[i] = IPyth.Price(10000000000, 1000000, -8, minPublishTime + 30);
+            }
+        }
+        return priceFeeds;
+    }
 }
 
 contract CustodialVaultTest is Test {
@@ -1314,5 +1343,143 @@ contract CustodialVaultTest is Test {
         vm.prank(LENDER);
         vault.withdrawByLender();
         assertTrue(vault.withdrawn());
+    }
+
+    function testUpdateHistoricalPrices() public {
+        // Send tokens to vault
+        payable(address(vault)).transfer(TOTAL_TOKEN_AMOUNT);
+
+        // Fast forward 24 hours
+        vm.warp(block.timestamp + 24 hours);
+
+        // Prepare timestamps for last 24 hours (every hour)
+        uint64[] memory timestamps = new uint64[](24);
+        uint256 currentTime = block.timestamp;
+        for (uint256 i = 0; i < 24; i++) {
+            timestamps[i] = uint64(currentTime - (24 - i) * 1 hours);
+        }
+
+        // Set different prices for testing
+        int64 pythPrice = 4000000000; // 40% of initial price
+        mockPyth.setPriceUnsafe(vault.IP_PRICE_FEED_ID(), pythPrice, 1000000, -8, block.timestamp);
+
+        // Prepare update data (mock)
+        bytes[] memory updateData = new bytes[](1);
+        updateData[0] = "";
+
+        // Calculate fee
+        uint256 fee = 0.001 ether * timestamps.length;
+
+        // Update historical prices
+        vault.updateHistoricalPrices{value: fee}(updateData, timestamps);
+
+        // Verify price history was updated
+        assertEq(vault.priceHistoryLength(), 24);
+        assertEq(vault.lastPriceUpdate(), timestamps[23]);
+    }
+
+    function testUpdateHistoricalPricesInvalidTimestamps() public {
+        payable(address(vault)).transfer(TOTAL_TOKEN_AMOUNT);
+        
+        // Fast forward to ensure we have enough time to subtract from
+        vm.warp(block.timestamp + 3 hours);
+
+        // Test with timestamps out of order
+        uint64[] memory timestamps = new uint64[](2);
+        timestamps[0] = uint64(block.timestamp - 1 hours);
+        timestamps[1] = uint64(block.timestamp - 2 hours); // Wrong order
+
+        bytes[] memory updateData = new bytes[](1);
+        updateData[0] = "";
+
+        vm.expectRevert(CustodialVault.InvalidPriceHistory.selector);
+        vault.updateHistoricalPrices{value: 0.002 ether}(updateData, timestamps);
+    }
+
+    function testUpdateHistoricalPricesTooOld() public {
+        payable(address(vault)).transfer(TOTAL_TOKEN_AMOUNT);
+        
+        // Fast forward to ensure we have enough time to subtract from
+        vm.warp(block.timestamp + 26 hours);
+
+        // Test with timestamp older than 24 hours
+        uint64[] memory timestamps = new uint64[](1);
+        timestamps[0] = uint64(block.timestamp - 25 hours);
+
+        bytes[] memory updateData = new bytes[](1);
+        updateData[0] = "";
+
+        vm.expectRevert(CustodialVault.InvalidAmount.selector);
+        vault.updateHistoricalPrices{value: 0.001 ether}(updateData, timestamps);
+    }
+
+    function testUpdateHistoricalPricesFuture() public {
+        payable(address(vault)).transfer(TOTAL_TOKEN_AMOUNT);
+
+        // Test with future timestamp
+        uint64[] memory timestamps = new uint64[](1);
+        timestamps[0] = uint64(block.timestamp + 1 hours);
+
+        bytes[] memory updateData = new bytes[](1);
+        updateData[0] = "";
+
+        vm.expectRevert(CustodialVault.InvalidAmount.selector);
+        vault.updateHistoricalPrices{value: 0.001 ether}(updateData, timestamps);
+    }
+
+    function testWithdrawAfterHistoricalUpdate() public {
+        // Send tokens to vault
+        payable(address(vault)).transfer(TOTAL_TOKEN_AMOUNT);
+
+        // Fast forward 24 hours
+        vm.warp(block.timestamp + 24 hours);
+
+        // Prepare timestamps for last 24 hours (every minute for full coverage)
+        uint64[] memory timestamps = new uint64[](1440);
+        uint256 currentTime = block.timestamp;
+        for (uint256 i = 0; i < 1440; i++) {
+            timestamps[i] = uint64(currentTime - (1440 - i) * 60);
+        }
+
+        // Set low price for withdrawal
+        int64 pythPrice = 4000000000; // 40% of initial price (60% drop)
+        mockPyth.setPriceUnsafe(vault.IP_PRICE_FEED_ID(), pythPrice, 1000000, -8, block.timestamp);
+
+        // Prepare update data
+        bytes[] memory updateData = new bytes[](1);
+        updateData[0] = "";
+
+        // Update historical prices
+        uint256 fee = 0.001 ether * timestamps.length;
+        vault.updateHistoricalPrices{value: fee}(updateData, timestamps);
+
+        // Update current price
+        vault.updatePrice();
+
+        // Now should be able to withdraw
+        vm.prank(LENDER);
+        vault.withdrawByLender();
+        assertTrue(vault.withdrawn());
+    }
+
+    function testUpdateHistoricalPricesRefund() public {
+        payable(address(vault)).transfer(TOTAL_TOKEN_AMOUNT);
+        
+        // Fast forward to ensure we have enough time to subtract from
+        vm.warp(block.timestamp + 2 hours);
+
+        uint64[] memory timestamps = new uint64[](1);
+        timestamps[0] = uint64(block.timestamp - 1 hours);
+
+        bytes[] memory updateData = new bytes[](1);
+        updateData[0] = "";
+
+        uint256 balanceBefore = address(this).balance;
+        
+        // Send excess fee
+        vault.updateHistoricalPrices{value: 0.01 ether}(updateData, timestamps);
+        
+        // Should receive refund (sent 0.01 ether, used 0.001 ether, so should get 0.009 ether back)
+        assertGe(address(this).balance, balanceBefore - 0.001 ether);
     }
 }

@@ -17,6 +17,14 @@ interface IPyth {
     function getPrice(bytes32 id) external view returns (Price memory price);
     function updatePriceFeeds(bytes[] calldata updateData) external payable;
     function getUpdateFee(bytes[] calldata updateData) external view returns (uint256 feeAmount);
+    
+    // Benchmark functions for historical price data
+    function parsePriceFeedUpdatesUnique(
+        bytes[] calldata updateData,
+        bytes32[] calldata priceIds,
+        uint64 minPublishTime,
+        uint64 maxPublishTime
+    ) external payable returns (Price[] memory priceFeeds);
 }
 
 /// @title CustodialVault
@@ -215,6 +223,100 @@ contract CustodialVault is ReentrancyGuardTransient {
         
         // Update price history
         _tryUpdatePrice();
+    }
+
+    /// @notice Update price history with historical benchmark data
+    /// @dev Uses Pyth Benchmarks to fill price history with up to 24 hours of historical data
+    /// @param pythUpdateData Array of price update data containing historical prices
+    /// @param timestamps Array of timestamps for which to retrieve prices (must be in ascending order)
+    function updateHistoricalPrices(
+        bytes[] calldata pythUpdateData,
+        uint64[] calldata timestamps
+    ) external payable {
+        if (pythUpdateData.length == 0 || timestamps.length == 0) revert InvalidAmount();
+        if (timestamps.length > MAX_PRICE_POINTS) revert InvalidAmount();
+        
+        // Validate timestamps
+        _validateTimestamps(timestamps);
+        
+        // Calculate fee and validate payment
+        uint256 totalFee = PYTH_ORACLE.getUpdateFee(pythUpdateData) * timestamps.length;
+        if (msg.value < totalFee) revert InvalidAmount();
+        
+        // Process updates
+        _processHistoricalUpdates(pythUpdateData, timestamps);
+        
+        // Update last price update time
+        if (timestamps.length > 0) {
+            lastPriceUpdate = timestamps[timestamps.length - 1];
+        }
+        
+        // Refund excess
+        if (msg.value > totalFee) {
+            Address.sendValue(payable(msg.sender), msg.value - totalFee);
+        }
+    }
+    
+    /// @notice Validate timestamps array
+    function _validateTimestamps(uint64[] calldata timestamps) internal view {
+        uint256 currentTime = block.timestamp;
+        uint256 cutoffTime = currentTime > TWAP_WINDOW ? currentTime - TWAP_WINDOW : 0;
+        uint64 previousTimestamp = 0;
+        
+        for (uint256 i = 0; i < timestamps.length; i++) {
+            if (timestamps[i] < cutoffTime || timestamps[i] > currentTime) revert InvalidAmount();
+            if (timestamps[i] <= previousTimestamp) revert InvalidPriceHistory();
+            previousTimestamp = timestamps[i];
+        }
+    }
+    
+    /// @notice Process historical price updates
+    function _processHistoricalUpdates(
+        bytes[] calldata pythUpdateData,
+        uint64[] calldata timestamps
+    ) internal {
+        bytes32[] memory priceIds = new bytes32[](1);
+        priceIds[0] = IP_PRICE_FEED_ID;
+        uint256 singleFee = PYTH_ORACLE.getUpdateFee(pythUpdateData);
+        
+        for (uint256 i = 0; i < timestamps.length; i++) {
+            _updateSingleHistoricalPrice(pythUpdateData, priceIds, timestamps[i], singleFee);
+        }
+    }
+    
+    /// @notice Update a single historical price
+    function _updateSingleHistoricalPrice(
+        bytes[] calldata pythUpdateData,
+        bytes32[] memory priceIds,
+        uint64 timestamp,
+        uint256 fee
+    ) internal {
+        // Calculate time bounds with overflow protection
+        uint64 minTime = timestamp > 60 ? timestamp - 60 : 0;
+        uint64 maxTime = timestamp < type(uint64).max - 60 ? timestamp + 60 : type(uint64).max;
+        
+        IPyth.Price[] memory prices = PYTH_ORACLE.parsePriceFeedUpdatesUnique{value: fee}(
+            pythUpdateData,
+            priceIds,
+            minTime,
+            maxTime
+        );
+        
+        if (prices.length > 0) {
+            uint256 price = _convertPythPrice(prices[0]);
+            
+            priceHistory[priceHistoryIndex] = PricePoint({
+                price: uint192(price),
+                timestamp: timestamp
+            });
+            priceHistoryIndex = (priceHistoryIndex + 1) % MAX_PRICE_POINTS;
+            
+            if (priceHistoryLength < MAX_PRICE_POINTS) {
+                priceHistoryLength++;
+            }
+            
+            emit PriceUpdated(price, timestamp);
+        }
     }
 
     /// @notice Try to update price if conditions are met
