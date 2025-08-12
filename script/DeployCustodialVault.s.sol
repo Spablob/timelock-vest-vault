@@ -55,7 +55,7 @@ contract DeployCustodialVault is Script {
         // Post-deployment verification
         console.log("\n=== Deployment Verification ===");
         console.log("Pyth Oracle Address:", address(vault.PYTH_ORACLE()));
-        console.log("Price Drop Threshold:", vault.PRICE_DROP_THRESHOLD(), "basis points");
+        console.log("Initial Price Drop Threshold:", vault.priceDropThreshold(), "basis points");
         console.log("TWAP Window:", vault.TWAP_WINDOW() / 1 hours, "hours");
         console.log("Max Price Age:", vault.MAX_PRICE_AGE() / 1 minutes, "minutes");
         console.log("Price Freshness Window:", vault.PRICE_FRESHNESS_WINDOW() / 1 minutes, "minutes");

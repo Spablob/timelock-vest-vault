@@ -23,14 +23,16 @@ interface IPyth {
 /// @notice A single-use custodial vault for one foundation and one lender
 ///         Anyone can transfer IP tokens to the vault
 ///         Foundation can withdraw after lock period with lender approval
-///         Lender can withdraw before lock period if price drops by 50% or more
+///         Lender can withdraw before lock period if price drops by threshold (initially 50%, adjustable)
+///         Foundation can propose to increase threshold with lender approval
 /// @dev Uses Pyth Oracle for price feeds and implements 24-hour TWAP for oracle manipulation protection
 contract CustodialVault is ReentrancyGuardTransient {
-    uint256 public constant PRICE_DROP_THRESHOLD = 5000; // 50% in basis points
     uint256 public constant BASIS_POINTS = 10000;
     uint256 public constant TWAP_WINDOW = 24 hours; // 24 hour TWAP window
     uint256 public constant MAX_PRICE_AGE = 5 minutes; // Maximum acceptable price age
     uint256 public constant PRICE_FRESHNESS_WINDOW = 2 minutes; // Price history must be updated within this window
+    uint256 public constant INITIAL_PRICE_DROP_THRESHOLD = 5000; // Initial 50% in basis points
+    uint256 public constant MAX_PRICE_DROP_THRESHOLD = 9000; // Maximum 90% in basis points
 
     // Pyth Oracle contract on Story chain
     // Mainnet: 0xD458261E832415CFd3BAE5E416FdF3230ce6F134
@@ -50,6 +52,13 @@ contract CustodialVault is ReentrancyGuardTransient {
     // Vault state
     bool public withdrawn;
     bool public lenderApproval;
+    
+    // Current price drop threshold (can be increased with lender approval)
+    uint256 public priceDropThreshold;
+    
+    // Threshold increase proposal
+    uint256 public proposedThreshold;
+    bool public thresholdProposalActive;
 
     struct PricePoint {
         uint192 price;     // Enough for prices up to 6.2e57 with 18 decimals
@@ -68,6 +77,9 @@ contract CustodialVault is ReentrancyGuardTransient {
     event TokensWithdrawnByLender(address indexed lender, uint256 amount, uint256 currentPrice);
     event LenderApprovalGranted(address indexed lender);
     event PriceUpdated(uint256 price, uint256 timestamp);
+    event ThresholdIncreaseProposed(uint256 proposedThreshold, address indexed proposer);
+    event ThresholdIncreaseApproved(uint256 newThreshold, address indexed approver);
+    event ThresholdIncreaseRejected(address indexed rejector);
 
     // Custom errors
     error InvalidAddress();
@@ -81,6 +93,9 @@ contract CustodialVault is ReentrancyGuardTransient {
     error StalePrice();
     error LenderApprovalRequired();
     error InsufficientPriceHistory();
+    error InvalidThreshold();
+    error ProposalAlreadyActive();
+    error NoActiveProposal();
 
     constructor(
         address _foundation,
@@ -98,6 +113,7 @@ contract CustodialVault is ReentrancyGuardTransient {
         initialPrice = _initialPrice;
         totalTokenAmount = _totalTokenAmount;
         lockEndTime = _lockEndTime;
+        priceDropThreshold = INITIAL_PRICE_DROP_THRESHOLD; // Initialize to 50%
     }
 
     receive() external payable {
@@ -150,10 +166,10 @@ contract CustodialVault is ReentrancyGuardTransient {
             revert InsufficientPriceHistory();
         }
 
-        // Check if price has dropped by 50% or more
+        // Check if price has dropped by the threshold amount or more
         if (currentPrice >= initialPrice) revert PriceDropThresholdNotMet();
         uint256 priceDropBps = ((initialPrice - currentPrice) * BASIS_POINTS) / initialPrice;
-        if (priceDropBps < PRICE_DROP_THRESHOLD) revert PriceDropThresholdNotMet();
+        if (priceDropBps < priceDropThreshold) revert PriceDropThresholdNotMet();
 
         withdrawn = true;
         uint256 amount = address(this).balance;
@@ -257,9 +273,9 @@ contract CustodialVault is ReentrancyGuardTransient {
             if (point.timestamp < cutoffTime) {
                 // Partial weight for the edge case
                 if (lastTimestamp > cutoffTime) {
-                    uint256 timeWeight = lastTimestamp - cutoffTime;
-                    weightedSum += lastPrice * timeWeight;
-                    totalWeight += timeWeight;
+                    uint256 partialTimeWeight = lastTimestamp - cutoffTime;
+                    weightedSum += lastPrice * partialTimeWeight;
+                    totalWeight += partialTimeWeight;
                 }
                 break;
             }
@@ -332,5 +348,53 @@ contract CustodialVault is ReentrancyGuardTransient {
     /// @notice Get price history length
     function getPriceHistoryLength() external view returns (uint256) {
         return priceHistoryLength;
+    }
+
+    /// @notice Get current timestamp
+    function getCurrentTime() external view returns (uint256) {
+        return block.timestamp;
+    }
+
+    /// @notice Allows foundation to propose an increase to the price drop threshold
+    /// @dev Can only increase the threshold (make it harder to withdraw), not decrease
+    /// @param newThreshold The new threshold in basis points (e.g., 6000 = 60%)
+    function proposeThresholdIncrease(uint256 newThreshold) external {
+        if (msg.sender != foundation) revert NotAuthorized();
+        if (withdrawn) revert AlreadyWithdrawn();
+        if (thresholdProposalActive) revert ProposalAlreadyActive();
+        
+        // Validate new threshold
+        if (newThreshold <= priceDropThreshold) revert InvalidThreshold(); // Must be an increase
+        if (newThreshold > MAX_PRICE_DROP_THRESHOLD) revert InvalidThreshold(); // Cannot exceed max
+        
+        proposedThreshold = newThreshold;
+        thresholdProposalActive = true;
+        
+        emit ThresholdIncreaseProposed(newThreshold, msg.sender);
+    }
+
+    /// @notice Allows lender to approve the proposed threshold increase
+    function approveThresholdIncrease() external {
+        if (msg.sender != lender) revert NotAuthorized();
+        if (!thresholdProposalActive) revert NoActiveProposal();
+        if (withdrawn) revert AlreadyWithdrawn();
+        
+        uint256 newThreshold = proposedThreshold;
+        priceDropThreshold = newThreshold;
+        thresholdProposalActive = false;
+        proposedThreshold = 0;
+        
+        emit ThresholdIncreaseApproved(newThreshold, msg.sender);
+    }
+
+    /// @notice Allows lender to reject the proposed threshold increase
+    function rejectThresholdIncrease() external {
+        if (msg.sender != lender) revert NotAuthorized();
+        if (!thresholdProposalActive) revert NoActiveProposal();
+        
+        thresholdProposalActive = false;
+        proposedThreshold = 0;
+        
+        emit ThresholdIncreaseRejected(msg.sender);
     }
 }

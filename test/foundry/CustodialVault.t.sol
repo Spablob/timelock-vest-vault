@@ -57,6 +57,9 @@ contract CustodialVaultTest is Test {
     event TokensWithdrawnByLender(address indexed lender, uint256 amount, uint256 currentPrice);
     event LenderApprovalGranted(address indexed lender);
     event PriceUpdated(uint256 price, uint256 timestamp);
+    event ThresholdIncreaseProposed(uint256 proposedThreshold, address indexed proposer);
+    event ThresholdIncreaseApproved(uint256 newThreshold, address indexed approver);
+    event ThresholdIncreaseRejected(address indexed rejector);
 
     function setUp() public {
         // Deploy mock Pyth oracle at the expected address (Aeneid testnet)
@@ -848,5 +851,271 @@ contract CustodialVaultTest is Test {
         // Verify lender received ALL funds
         assertEq(LENDER.balance, lenderBalanceBefore + totalVaultBalance);
         assertEq(address(vault).balance, 0);
+    }
+
+    // Test threshold increase functionality
+    function testProposeThresholdIncrease() public {
+        payable(address(vault)).transfer(TOTAL_TOKEN_AMOUNT);
+        
+        // Check initial threshold is 50%
+        assertEq(vault.priceDropThreshold(), 5000);
+        
+        // Foundation proposes increase to 60%
+        vm.prank(FOUNDATION);
+        vm.expectEmit(true, true, false, true);
+        emit ThresholdIncreaseProposed(6000, FOUNDATION);
+        vault.proposeThresholdIncrease(6000);
+        
+        // Check proposal state
+        assertEq(vault.proposedThreshold(), 6000);
+        assertTrue(vault.thresholdProposalActive());
+    }
+
+    function testProposeThresholdIncreaseNotAuthorized() public {
+        payable(address(vault)).transfer(TOTAL_TOKEN_AMOUNT);
+        
+        // Non-foundation cannot propose
+        vm.prank(LENDER);
+        vm.expectRevert(CustodialVault.NotAuthorized.selector);
+        vault.proposeThresholdIncrease(6000);
+        
+        vm.prank(OTHER_USER);
+        vm.expectRevert(CustodialVault.NotAuthorized.selector);
+        vault.proposeThresholdIncrease(6000);
+    }
+
+    function testProposeThresholdIncreaseInvalidThreshold() public {
+        payable(address(vault)).transfer(TOTAL_TOKEN_AMOUNT);
+        
+        // Cannot propose decrease
+        vm.prank(FOUNDATION);
+        vm.expectRevert(CustodialVault.InvalidThreshold.selector);
+        vault.proposeThresholdIncrease(4000); // Less than current 50%
+        
+        // Cannot propose same threshold
+        vm.prank(FOUNDATION);
+        vm.expectRevert(CustodialVault.InvalidThreshold.selector);
+        vault.proposeThresholdIncrease(5000); // Same as current
+        
+        // Cannot exceed max
+        vm.prank(FOUNDATION);
+        vm.expectRevert(CustodialVault.InvalidThreshold.selector);
+        vault.proposeThresholdIncrease(9001); // > 90%
+    }
+
+    function testProposeThresholdIncreaseAlreadyActive() public {
+        payable(address(vault)).transfer(TOTAL_TOKEN_AMOUNT);
+        
+        // First proposal
+        vm.prank(FOUNDATION);
+        vault.proposeThresholdIncrease(6000);
+        
+        // Cannot propose another while active
+        vm.prank(FOUNDATION);
+        vm.expectRevert(CustodialVault.ProposalAlreadyActive.selector);
+        vault.proposeThresholdIncrease(7000);
+    }
+
+    function testApproveThresholdIncrease() public {
+        payable(address(vault)).transfer(TOTAL_TOKEN_AMOUNT);
+        
+        // Foundation proposes
+        vm.prank(FOUNDATION);
+        vault.proposeThresholdIncrease(6000);
+        
+        // Lender approves
+        vm.prank(LENDER);
+        vm.expectEmit(true, true, false, true);
+        emit ThresholdIncreaseApproved(6000, LENDER);
+        vault.approveThresholdIncrease();
+        
+        // Check new threshold is active
+        assertEq(vault.priceDropThreshold(), 6000);
+        assertFalse(vault.thresholdProposalActive());
+        assertEq(vault.proposedThreshold(), 0);
+    }
+
+    function testApproveThresholdIncreaseNotAuthorized() public {
+        payable(address(vault)).transfer(TOTAL_TOKEN_AMOUNT);
+        
+        // Foundation proposes
+        vm.prank(FOUNDATION);
+        vault.proposeThresholdIncrease(6000);
+        
+        // Non-lender cannot approve
+        vm.prank(FOUNDATION);
+        vm.expectRevert(CustodialVault.NotAuthorized.selector);
+        vault.approveThresholdIncrease();
+        
+        vm.prank(OTHER_USER);
+        vm.expectRevert(CustodialVault.NotAuthorized.selector);
+        vault.approveThresholdIncrease();
+    }
+
+    function testApproveThresholdIncreaseNoActiveProposal() public {
+        payable(address(vault)).transfer(TOTAL_TOKEN_AMOUNT);
+        
+        // Cannot approve without proposal
+        vm.prank(LENDER);
+        vm.expectRevert(CustodialVault.NoActiveProposal.selector);
+        vault.approveThresholdIncrease();
+    }
+
+    function testRejectThresholdIncrease() public {
+        payable(address(vault)).transfer(TOTAL_TOKEN_AMOUNT);
+        
+        // Foundation proposes
+        vm.prank(FOUNDATION);
+        vault.proposeThresholdIncrease(6000);
+        
+        // Lender rejects
+        vm.prank(LENDER);
+        vm.expectEmit(true, false, false, true);
+        emit ThresholdIncreaseRejected(LENDER);
+        vault.rejectThresholdIncrease();
+        
+        // Check threshold unchanged
+        assertEq(vault.priceDropThreshold(), 5000);
+        assertFalse(vault.thresholdProposalActive());
+        assertEq(vault.proposedThreshold(), 0);
+    }
+
+    function testRejectThresholdIncreaseNotAuthorized() public {
+        payable(address(vault)).transfer(TOTAL_TOKEN_AMOUNT);
+        
+        // Foundation proposes
+        vm.prank(FOUNDATION);
+        vault.proposeThresholdIncrease(6000);
+        
+        // Non-lender cannot reject
+        vm.prank(FOUNDATION);
+        vm.expectRevert(CustodialVault.NotAuthorized.selector);
+        vault.rejectThresholdIncrease();
+        
+        vm.prank(OTHER_USER);
+        vm.expectRevert(CustodialVault.NotAuthorized.selector);
+        vault.rejectThresholdIncrease();
+    }
+
+    function testRejectThresholdIncreaseNoActiveProposal() public {
+        payable(address(vault)).transfer(TOTAL_TOKEN_AMOUNT);
+        
+        // Cannot reject without proposal
+        vm.prank(LENDER);
+        vm.expectRevert(CustodialVault.NoActiveProposal.selector);
+        vault.rejectThresholdIncrease();
+    }
+
+    function testWithdrawalWithIncreasedThreshold() public {
+        payable(address(vault)).transfer(TOTAL_TOKEN_AMOUNT);
+        
+        // Foundation proposes increase to 60%
+        vm.prank(FOUNDATION);
+        vault.proposeThresholdIncrease(6000);
+        
+        // Lender approves
+        vm.prank(LENDER);
+        vault.approveThresholdIncrease();
+        
+        // Build 24 hours of price history at 45% of initial (55% drop)
+        for (uint256 i = 0; i < 1440; i++) {
+            vm.warp(block.timestamp + 1 minutes);
+            int64 pythPrice = 4500000000; // 45% of initial price
+            mockPyth.setPriceUnsafe(vault.IP_PRICE_FEED_ID(), pythPrice, 1000000, -8, block.timestamp);
+            vault.updatePrice();
+        }
+        
+        // Should not be able to withdraw at 55% drop (need 60%)
+        vm.prank(LENDER);
+        vm.expectRevert(CustodialVault.PriceDropThresholdNotMet.selector);
+        vault.withdrawByLender();
+        
+        // Build 24 hours of price history at 39% of initial (61% drop)
+        for (uint256 i = 0; i < 1440; i++) {
+            vm.warp(block.timestamp + 1 minutes);
+            int64 pythPrice = 3900000000; // 39% of initial price
+            mockPyth.setPriceUnsafe(vault.IP_PRICE_FEED_ID(), pythPrice, 1000000, -8, block.timestamp);
+            vault.updatePrice();
+        }
+        
+        // Now should be able to withdraw
+        vm.prank(LENDER);
+        vault.withdrawByLender();
+        
+        assertTrue(vault.withdrawn());
+    }
+
+    function testCannotProposeThresholdAfterWithdrawn() public {
+        payable(address(vault)).transfer(TOTAL_TOKEN_AMOUNT);
+        
+        // Build full 24 hours of price history at 40% price (60% drop)
+        for (uint256 i = 0; i < 1440; i++) {
+            vm.warp(block.timestamp + 1 minutes);
+            int64 pythPrice = 4000000000; // 40% of initial price
+            mockPyth.setPriceUnsafe(vault.IP_PRICE_FEED_ID(), pythPrice, 1000000, -8, block.timestamp);
+            vault.updatePrice();
+        }
+        
+        // Lender withdraws
+        vm.prank(LENDER);
+        vault.withdrawByLender();
+        
+        // Cannot propose after withdrawal
+        vm.prank(FOUNDATION);
+        vm.expectRevert(CustodialVault.AlreadyWithdrawn.selector);
+        vault.proposeThresholdIncrease(6000);
+    }
+
+    function testCannotApproveThresholdAfterWithdrawn() public {
+        payable(address(vault)).transfer(TOTAL_TOKEN_AMOUNT);
+        
+        // Foundation proposes
+        vm.prank(FOUNDATION);
+        vault.proposeThresholdIncrease(6000);
+        
+        // Build full 24 hours of price history at 40% price (60% drop)
+        for (uint256 i = 0; i < 1440; i++) {
+            vm.warp(block.timestamp + 1 minutes);
+            int64 pythPrice = 4000000000; // 40% of initial price
+            mockPyth.setPriceUnsafe(vault.IP_PRICE_FEED_ID(), pythPrice, 1000000, -8, block.timestamp);
+            vault.updatePrice();
+        }
+        
+        // Lender withdraws
+        vm.prank(LENDER);
+        vault.withdrawByLender();
+        
+        // Cannot approve after withdrawal
+        vm.prank(LENDER);
+        vm.expectRevert(CustodialVault.AlreadyWithdrawn.selector);
+        vault.approveThresholdIncrease();
+    }
+
+    function testMultipleThresholdIncreases() public {
+        payable(address(vault)).transfer(TOTAL_TOKEN_AMOUNT);
+        
+        // First increase: 50% -> 60%
+        vm.prank(FOUNDATION);
+        vault.proposeThresholdIncrease(6000);
+        
+        vm.prank(LENDER);
+        vault.approveThresholdIncrease();
+        assertEq(vault.priceDropThreshold(), 6000);
+        
+        // Second increase: 60% -> 70%
+        vm.prank(FOUNDATION);
+        vault.proposeThresholdIncrease(7000);
+        
+        vm.prank(LENDER);
+        vault.approveThresholdIncrease();
+        assertEq(vault.priceDropThreshold(), 7000);
+        
+        // Third increase: 70% -> 80%
+        vm.prank(FOUNDATION);
+        vault.proposeThresholdIncrease(8000);
+        
+        vm.prank(LENDER);
+        vault.approveThresholdIncrease();
+        assertEq(vault.priceDropThreshold(), 8000);
     }
 }
