@@ -15,8 +15,7 @@ contract VerifyPythAddresses is Test {
             address(0x1),
             address(0x2),
             1e18,
-            1000 ether,
-            block.timestamp + 30 days
+            1000 ether
         );
         
         // Verify the Pyth oracle address matches expected testnet address

@@ -54,7 +54,7 @@ contract DeployVaults is Script {
                 CLIFF_UNLOCK_PERCENTAGE,
                 STAKING_REWARD_UNLOCK_START,
                 beneficiaryHash,
-                allocation.lockedAmount * 1e18
+                allocation.lockedAmount
             );
             output = vm.serializeAddress("", vm.toString(allocation.beneficiary), address(vault));
             console2.log("Vault deployed: ", address(vault));
@@ -166,5 +166,19 @@ contract DeployVaultsWithFactory is DeployVaults {
 
     function _getFactoryAddress() internal view virtual returns (address) {
         return vm.envAddress("STORY_VAULT_FACTORY");
+    }
+}
+
+contract DeployInvestorVaults is DeployVaultsWithFactory {
+    function _getFactoryAddress() internal view override returns (address) {
+//        2 years unlock
+//        return address(0x9E2C518916e3C4402480e4C310Bc859A9B1907Be);
+        return address(0x93028b4234641c0231b56000b06a0CB1b86cA55e);
+    }
+}
+
+contract DeployEmployeeVaults is DeployVaultsWithFactory {
+    function _getFactoryAddress() internal view override returns (address) {
+        return address(0x04a7b04b0BFA20993f2E6795Cbb5Dba43781dc55);
     }
 }

@@ -7,7 +7,7 @@ import "../contracts/CustodialVault.sol";
 contract DeployCustodialVault is Script {
     // Deployment parameters
 
-    address public constant FOUNDATION = address(0x623Cb5A594dAD5cc1Ea1bDb0b084bf8F1fE4B2e4); // Replace with actual foundation address
+    address public constant BORROWER = address(0x623Cb5A594dAD5cc1Ea1bDb0b084bf8F1fE4B2e4); // Replace with actual borrower address
     address public constant LENDER = address(0x4a311575D3dD3e4c70A7C8A3B4C2056e26427Dbf); // Replace with actual lender address
     
     // IP token price feed ID on Story chain (now hardcoded in CustodialVault contract)
@@ -19,8 +19,7 @@ contract DeployCustodialVault is Script {
     // Total token amount expected in the vault
     uint256 public constant TOTAL_TOKEN_AMOUNT = 1000000 ether; // 1M IP tokens
     
-    // Lock duration in seconds (8 months = ~243 days)
-    uint256 public constant LOCK_DURATION = 243 days;
+    // Note: Lock duration is now set when ackLoanReceived() is called (8 months from acknowledgment)
 
     function run() external {
         // Load private key from environment
@@ -29,39 +28,34 @@ contract DeployCustodialVault is Script {
         // Start broadcasting transactions
         vm.startBroadcast(deployerPrivateKey);
         
-        // Calculate lock end time
-        uint256 lockEndTime = block.timestamp + LOCK_DURATION;
-        
         // Deploy CustodialVault
         CustodialVault vault = new CustodialVault(
-            FOUNDATION,
+            BORROWER,
             LENDER,
             INITIAL_PRICE,
-            TOTAL_TOKEN_AMOUNT,
-            lockEndTime
+            TOTAL_TOKEN_AMOUNT
         );
         
         // Log deployment information
         console.log("CustodialVault deployed at:", address(vault));
-        console.log("Foundation:", FOUNDATION);
+        console.log("Borrower:", BORROWER);
         console.log("Lender:", LENDER);
         console.log("Initial Price:", INITIAL_PRICE);
         console.log("Total Token Amount:", TOTAL_TOKEN_AMOUNT);
-        console.log("Lock End Time:", lockEndTime);
-        console.log("Lock End Date:", _timestampToString(lockEndTime));
+        console.log("Vault Status: Not started (Foundation must call ackLoanReceived())");
         
         vm.stopBroadcast();
         
         // Post-deployment verification
         console.log("\n=== Deployment Verification ===");
         console.log("Pyth Oracle Address:", address(vault.PYTH_ORACLE()));
-        console.log("Initial Price Drop Threshold:", vault.priceDropThreshold(), "basis points");
+        console.log("Liquidation Price:", vault.liquidationPrice() / 1e18, "USD");
         console.log("TWAP Window:", vault.TWAP_WINDOW() / 1 hours, "hours");
         console.log("Max Price Age:", vault.MAX_PRICE_AGE() / 1 minutes, "minutes");
-        console.log("Price Freshness Window:", vault.PRICE_FRESHNESS_WINDOW() / 1 minutes, "minutes");
+        console.log("Price Freshness Window:", vault.PRICE_FRESHNESS_WINDOW() / 1 hours, "hours");
         
         // Write deployment info to file
-        _writeDeploymentInfo(address(vault), lockEndTime);
+        _writeDeploymentInfo(address(vault));
     }
     
     function _timestampToString(uint256 timestamp) internal view returns (string memory) {
@@ -70,12 +64,12 @@ contract DeployCustodialVault is Script {
         return string(abi.encodePacked("~", vm.toString(daysFromNow), " days from now"));
     }
     
-    function _writeDeploymentInfo(address vaultAddress, uint256 lockEndTime) internal {
+    function _writeDeploymentInfo(address vaultAddress) internal {
         // Build JSON in smaller parts to avoid stack too deep
         string memory part1 = string(abi.encodePacked(
             "{\n",
             '  "vault": "', vm.toString(vaultAddress), '",\n',
-            '  "foundation": "', vm.toString(FOUNDATION), '",\n'
+            '  "borrower": "', vm.toString(BORROWER), '",\n'
         ));
         
         string memory part2 = string(abi.encodePacked(
@@ -85,7 +79,7 @@ contract DeployCustodialVault is Script {
         
         string memory part3 = string(abi.encodePacked(
             '  "totalTokenAmount": "', vm.toString(TOTAL_TOKEN_AMOUNT), '",\n',
-            '  "lockEndTime": ', vm.toString(lockEndTime), ',\n'
+            '  "started": false,\n'
         ));
         
         string memory part4 = string(abi.encodePacked(

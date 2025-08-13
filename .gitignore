@@ -14,6 +14,10 @@ forge-cache/
 
 # Dotenv file
 .env
+.env.*
+!.env.example
+!.env.*.example
+.env.custodial.example
 
 .idea/
 node_modules/
@@ -21,6 +25,11 @@ node_modules/
 .vscode
 .DS_Store
 
-/script/python/venv/
+/script/python/
 /allocations/
 /venv/
+*.py
+__pycache__/
+*.pyc
+
+

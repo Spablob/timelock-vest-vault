@@ -13,35 +13,50 @@ interface IPyth {
         uint256 publishTime;
     }
 
+    struct PriceFeed {
+        bytes32 id;
+        Price price;
+        Price emaPrice;
+    }
+
     function getPriceUnsafe(bytes32 id) external view returns (Price memory price);
     function getPrice(bytes32 id) external view returns (Price memory price);
     function updatePriceFeeds(bytes[] calldata updateData) external payable;
     function getUpdateFee(bytes[] calldata updateData) external view returns (uint256 feeAmount);
     
-    // Benchmark functions for historical price data
-    function parsePriceFeedUpdatesUnique(
+    // Functions for parsing price data without updating on-chain state
+    function parsePriceFeedUpdates(
         bytes[] calldata updateData,
         bytes32[] calldata priceIds,
         uint64 minPublishTime,
         uint64 maxPublishTime
-    ) external payable returns (Price[] memory priceFeeds);
+    ) external payable returns (PriceFeed[] memory priceFeeds);
 }
 
 /// @title CustodialVault
-/// @notice A single-use custodial vault for one foundation and one lender
-///         Anyone can transfer IP tokens to the vault
-///         Foundation can withdraw after lock period with lender approval
-///         Lender can withdraw before lock period if price drops by threshold (initially 50%, adjustable)
-///         Lender can withdraw after lock period without any restrictions
-///         Foundation can propose to increase threshold with lender approval
+/// @notice A single-use custodial vault for one borrower and one lender
+///         Borrower must call depositCollateral() to transfer IP tokens to the vault
+///         Borrower must call ackLoanReceived() within 3 days to begin the 8-month lock period
+///         Within 3 days after deposit: borrower cannot withdraw tokens
+///         After 3 days if ackLoanReceived() not called: borrower can withdraw tokens
+///         Once ackLoanReceived() is called: borrower cannot withdraw tokens anymore
+///         
+///         Lender withdrawal conditions:
+///         1. If not started: lender cannot withdraw
+///         2. If started and before lock end: lender can withdraw if liquidation requested 
+///            (TWAP <= liquidation price) and 24-hour liquidation window has passed
+///         3. If started and after lock end: lender can withdraw without any restrictions
+///         
+///         Emergency withdrawal: Borrower can propose emergency withdrawal to any address,
+///         which requires lender approval before execution
 /// @dev Uses Pyth Oracle for price feeds and implements 24-hour TWAP for oracle manipulation protection
 contract CustodialVault is ReentrancyGuardTransient {
     uint256 public constant BASIS_POINTS = 10000;
     uint256 public constant TWAP_WINDOW = 24 hours; // 24 hour TWAP window
     uint256 public constant MAX_PRICE_AGE = 5 minutes; // Maximum acceptable price age
-    uint256 public constant PRICE_FRESHNESS_WINDOW = 2 minutes; // Price history must be updated within this window
-    uint256 public constant INITIAL_PRICE_DROP_THRESHOLD = 5000; // Initial 50% in basis points
-    uint256 public constant MAX_PRICE_DROP_THRESHOLD = 9000; // Maximum 90% in basis points
+    uint256 public constant PRICE_FRESHNESS_WINDOW = 1 hours; // Price history must be updated within this window
+    uint256 public constant LIQUIDATION_TIME_WINDOW = 24 hours; // 24 hour liquidation waiting period
+    uint256 public constant MAX_CONFIDENCE_BPS = 300; // 3% maximum confidence interval in basis points
 
     // Pyth Oracle contract on Story chain
     // Mainnet: 0xD458261E832415CFd3BAE5E416FdF3230ce6F134
@@ -52,22 +67,29 @@ contract CustodialVault is ReentrancyGuardTransient {
     bytes32 public constant IP_PRICE_FEED_ID = 0xb620ba83044577029da7e4ded7a2abccf8e6afc2a0d4d26d89ccdd39ec109025;
 
     // Vault configuration
-    address public immutable foundation;
+    address public immutable borrower;
     address public immutable lender;
-    uint256 public immutable initialPrice;
+    uint256 public liquidationPrice; // Can be updated with lender approval
     uint256 public immutable totalTokenAmount;
-    uint256 public immutable lockEndTime;
+    uint256 public lockEndTime;
 
     // Vault state
     bool public withdrawn;
-    bool public lenderApproval;
+    bool public started;
+    uint256 public depositTime; // Timestamp when borrower deposits tokens
     
-    // Current price drop threshold (can be increased with lender approval)
-    uint256 public priceDropThreshold;
+    // Liquidation price update state
+    uint256 public proposedLiquidationPrice;
+    bool public liquidationPriceProposalActive;
     
-    // Threshold increase proposal
-    uint256 public proposedThreshold;
-    bool public thresholdProposalActive;
+    // Liquidation request state
+    uint256 public liquidationRequestTime; // Timestamp when lender requested liquidation
+    bool public liquidationRequestActive;
+    
+    // Emergency withdrawal state
+    address public proposedEmergencyRecipient;
+    bool public emergencyWithdrawalProposed;
+    bool public emergencyWithdrawalApproved;
 
     struct PricePoint {
         uint192 price;     // Enough for prices up to 6.2e57 with 18 decimals
@@ -82,13 +104,20 @@ contract CustodialVault is ReentrancyGuardTransient {
     uint256 public lastPriceUpdate;
 
     // Events
-    event TokensWithdrawnByFoundation(address indexed foundation, address indexed recipient, uint256 amount);
+    event TokensWithdrawnByBorrower(address indexed borrower, address indexed recipient, uint256 amount);
     event TokensWithdrawnByLender(address indexed lender, uint256 amount, uint256 currentPrice);
-    event LenderApprovalGranted(address indexed lender);
     event PriceUpdated(uint256 price, uint256 timestamp);
-    event ThresholdIncreaseProposed(uint256 proposedThreshold, address indexed proposer);
-    event ThresholdIncreaseApproved(uint256 newThreshold, address indexed approver);
-    event ThresholdIncreaseRejected(address indexed rejector);
+    event VaultStarted(uint256 lockEndTime);
+    event TokensDeposited(address indexed depositor, uint256 amount);
+    event LiquidationPriceProposed(uint256 oldPrice, uint256 newPrice);
+    event LiquidationPriceUpdated(uint256 oldPrice, uint256 newPrice);
+    event LiquidationPriceProposalRejected(uint256 proposedPrice);
+    event LiquidationRequested(uint256 timestamp, uint256 twapPrice);
+    event LiquidationCancelled(uint256 reason); // 0: manual cancel, 1: price update
+    event EmergencyWithdrawalProposed(address indexed proposer, address indexed recipient);
+    event EmergencyWithdrawalApproved(address indexed approver);
+    event EmergencyWithdrawalExecuted(address indexed recipient, uint256 amount);
+    event EmergencyWithdrawalCancelled();
 
     // Custom errors
     error InvalidAddress();
@@ -100,102 +129,190 @@ contract CustodialVault is ReentrancyGuardTransient {
     error AlreadyWithdrawn();
     error PriceDropThresholdNotMet();
     error StalePrice();
-    error LenderApprovalRequired();
     error InsufficientPriceHistory();
-    error InvalidThreshold();
-    error ProposalAlreadyActive();
-    error NoActiveProposal();
     error InvalidPriceHistory();
+    error AlreadyStarted();
+    error NotStarted();
+    error AlreadyDeposited();
+    error NotDeposited();
+    error WithdrawalNotAllowed();
+    error NoActiveProposal();
+    error ProposalAlreadyActive();
+    error NoActiveLiquidationRequest();
+    error LiquidationRequestAlreadyActive();
+    error LiquidationTimeWindowNotPassed();
+    error EmergencyWithdrawalNotApproved();
+    error NoEmergencyWithdrawalProposed();
+    error ExcessiveConfidenceInterval();
+    error EmptyPriceUpdateData();
+    error TooManyPriceUpdates();
+    error TimestampOutOfRange();
 
     constructor(
-        address _foundation,
+        address _borrower,
         address _lender,
-        uint256 _initialPrice,
-        uint256 _totalTokenAmount,
-        uint256 _lockEndTime
+        uint256 _liquidationPrice,
+        uint256 _totalTokenAmount
     ) {
-        if (_foundation == address(0) || _lender == address(0)) revert InvalidAddress();
-        if (_initialPrice == 0 || _totalTokenAmount == 0) revert InvalidAmount();
-        if (_lockEndTime <= block.timestamp) revert InvalidTime();
+        if (_borrower == address(0) || _lender == address(0)) revert InvalidAddress();
+        if (_liquidationPrice == 0 || _totalTokenAmount == 0) revert InvalidAmount();
 
-        foundation = _foundation;
+        borrower = _borrower;
         lender = _lender;
-        initialPrice = _initialPrice;
+        liquidationPrice = _liquidationPrice;
         totalTokenAmount = _totalTokenAmount;
-        lockEndTime = _lockEndTime;
-        priceDropThreshold = INITIAL_PRICE_DROP_THRESHOLD; // Initialize to 50%
     }
 
     receive() external payable {
-        // Accept funds without updating price to save gas
-        // Price updates can be triggered via updatePrice() function
+        // Accept funds without restriction for backwards compatibility
+        // The depositCollateral() function is the preferred method for borrower deposits
     }
 
-    /// @notice Allows foundation to withdraw all tokens after lock period with lender approval
+    /// @notice Acknowledges loan received and starts the vault lock period (can only be called once by borrower)
+    /// @dev Sets the lock end time to current time + 8 months
+    function ackLoanReceived() external {
+        if (msg.sender != borrower) revert NotAuthorized();
+        if (started) revert AlreadyStarted();
+        if (depositTime == 0) revert NotDeposited();
+        
+        started = true;
+        lockEndTime = block.timestamp + 8 * 30 days; // Approximately 8 months
+        
+        emit VaultStarted(lockEndTime);
+    }
+
+    /// @notice Allows borrower to deposit IP tokens as collateral to the vault
+    /// @dev Can only be called once, starts the 3-day waiting period before withdrawal is allowed
+    function depositCollateral() external payable {
+        if (msg.sender != borrower) revert NotAuthorized();
+        if (depositTime != 0) revert AlreadyDeposited();
+        if (msg.value == 0) revert InvalidAmount();
+        
+        depositTime = block.timestamp;
+        
+        emit TokensDeposited(msg.sender, msg.value);
+    }
+
+    /// @notice Allows borrower to withdraw tokens under specific conditions
+    /// @dev Within 3 days of deposit: borrower cannot withdraw
+    /// @dev After 3 days of deposit: can withdraw only if ackLoanReceived() was never called
+    /// @dev Once ackLoanReceived() is called: borrower cannot withdraw at all
     /// @param recipient The address to receive the withdrawn tokens
-    function withdrawByFoundation(address recipient) external nonReentrant {
-        if (msg.sender != foundation) revert NotAuthorized();
-        if (block.timestamp < lockEndTime) revert LockPeriodNotExpired();
-        if (!lenderApproval) revert LenderApprovalRequired();
+    function withdrawByBorrower(address recipient) external nonReentrant {
+        if (msg.sender != borrower) revert NotAuthorized();
         if (withdrawn) revert AlreadyWithdrawn();
         if (recipient == address(0)) revert InvalidAddress();
+        if (depositTime == 0) revert NotDeposited();
+
+        // If ackLoanReceived() has been called, borrower cannot withdraw
+        if (started) {
+            revert WithdrawalNotAllowed();
+        }
+
+        // Within 3 days: borrower cannot withdraw
+        if (block.timestamp <= depositTime + 3 days) {
+            revert WithdrawalNotAllowed();
+        }
+
+        // After 3 days: can withdraw if ackLoanReceived() was never called
 
         withdrawn = true;
         uint256 amount = address(this).balance;
-
-        emit TokensWithdrawnByFoundation(foundation, recipient, amount);
-
+        emit TokensWithdrawnByBorrower(borrower, recipient, amount);
         Address.sendValue(payable(recipient), amount);
     }
 
-    /// @notice Allows lender to approve foundation withdrawal
-    function approveFoundationWithdrawal() external {
-        if (msg.sender != lender) revert NotAuthorized();
-        if (block.timestamp < lockEndTime) revert LockPeriodNotExpired();
-        
-        lenderApproval = true;
-        emit LenderApprovalGranted(lender);
-    }
 
+    /// @notice Allows lender to request liquidation when TWAP is below liquidation price
+    /// @dev Starts the 24-hour liquidation time window
+    function requestLiquidation() external {
+        if (msg.sender != lender) revert NotAuthorized();
+        if (withdrawn) revert AlreadyWithdrawn();
+        if (liquidationRequestActive) revert LiquidationRequestAlreadyActive();
+        
+        // Vault must be started to request liquidation
+        if (!started) revert NotStarted();
+        
+        // After lock end, lender can withdraw directly without liquidation request
+        if (block.timestamp >= lockEndTime) {
+            revert WithdrawalNotAllowed(); // Use withdrawByLender instead
+        }
+        
+        // Ensure price history is fresh
+        if (block.timestamp - lastPriceUpdate > PRICE_FRESHNESS_WINDOW) revert StalePrice();
+        
+        // Get TWAP price
+        uint256 twapPrice = _getTWAPPrice();
+        
+        // Check if we have sufficient price history
+        if (priceHistoryLength < MAX_PRICE_POINTS) {
+            revert InsufficientPriceHistory();
+        }
+        
+        // Validate price history integrity
+        _validatePriceHistory();
+        
+        // Check if TWAP is at or below liquidation price
+        if (twapPrice > liquidationPrice) revert PriceDropThresholdNotMet();
+        
+        // Set liquidation request
+        liquidationRequestActive = true;
+        liquidationRequestTime = block.timestamp;
+        
+        emit LiquidationRequested(block.timestamp, twapPrice);
+    }
+    
+    /// @notice Allows lender to cancel an active liquidation request
+    function cancelLiquidationRequest() external {
+        if (msg.sender != lender) revert NotAuthorized();
+        if (!liquidationRequestActive) revert NoActiveLiquidationRequest();
+        
+        liquidationRequestActive = false;
+        liquidationRequestTime = 0;
+        
+        emit LiquidationCancelled(0); // 0: manual cancel
+    }
+    
     /// @notice Allows lender to withdraw all tokens
-    /// @dev Before lock end: requires price drop >= threshold
-    /// @dev After lock end: no restrictions, can withdraw anytime
+    /// @dev If not started: cannot withdraw
+    /// @dev If started and before lock end: requires active liquidation request and 24-hour wait
+    /// @dev If started and after lock end: no restrictions, can withdraw anytime
     function withdrawByLender() external nonReentrant {
         if (msg.sender != lender) revert NotAuthorized();
         if (withdrawn) revert AlreadyWithdrawn();
+        
+        // Vault must be started for lender to withdraw
+        if (!started) revert NotStarted();
         
         uint256 currentPrice = 0;
         
         // Different rules based on whether lock period has ended
         if (block.timestamp < lockEndTime) {
-            // Before lock end: enforce price drop requirements
+            // Before lock end: require liquidation request and wait period
+            if (!liquidationRequestActive) revert NoActiveLiquidationRequest();
             
-            // Ensure price history is fresh (updated within PRICE_FRESHNESS_WINDOW)
-            if (block.timestamp - lastPriceUpdate > PRICE_FRESHNESS_WINDOW) revert StalePrice();
-
-            // Get TWAP price
-            currentPrice = _getTWAPPrice();
-
-            // Check if we have sufficient price history (must have full 24 hours of data)
-            if (priceHistoryLength < MAX_PRICE_POINTS) {
-                revert InsufficientPriceHistory();
+            // Check if 24-hour liquidation time window has passed
+            if (block.timestamp < liquidationRequestTime + LIQUIDATION_TIME_WINDOW) {
+                revert LiquidationTimeWindowNotPassed();
             }
             
-            // Validate price history integrity
-            _validatePriceHistory();
-
-            // Check if price has dropped by the threshold amount or more
-            if (currentPrice >= initialPrice) revert PriceDropThresholdNotMet();
-            uint256 priceDropBps = ((initialPrice - currentPrice) * BASIS_POINTS) / initialPrice;
-            if (priceDropBps < priceDropThreshold) revert PriceDropThresholdNotMet();
+            // Get current price for event (may be stale after 24h wait, but that's OK)
+            try this.getCurrentTWAP() returns (uint256 twap) {
+                currentPrice = twap;
+            } catch {
+                // Price may be stale after waiting, use 0 for event
+                currentPrice = 0;
+            }
         }
         // After lock end: no restrictions, lender can withdraw freely
-
+        
         withdrawn = true;
+        liquidationRequestActive = false;
+        liquidationRequestTime = 0;
         uint256 amount = address(this).balance;
-
+        
         emit TokensWithdrawnByLender(lender, amount, currentPrice);
-
+        
         Address.sendValue(payable(lender), amount);
     }
 
@@ -204,37 +321,17 @@ contract CustodialVault is ReentrancyGuardTransient {
         _tryUpdatePrice();
     }
 
-    /// @notice Refresh Pyth price feeds and update price history
-    /// @dev Anyone can call this to ensure price data is fresh
-    /// @param pythUpdateData Price update data from Pyth oracle
-    function refreshFeedsAndUpdatePrice(bytes[] calldata pythUpdateData) external payable {
-        // Update Pyth price feeds if data provided
-        if (pythUpdateData.length > 0) {
-            uint256 updateFee = PYTH_ORACLE.getUpdateFee(pythUpdateData);
-            if (msg.value < updateFee) revert InvalidAmount();
-            
-            PYTH_ORACLE.updatePriceFeeds{value: updateFee}(pythUpdateData);
-            
-            // Refund excess payment
-            if (msg.value > updateFee) {
-                Address.sendValue(payable(msg.sender), msg.value - updateFee);
-            }
-        }
-        
-        // Update price history
-        _tryUpdatePrice();
-    }
 
-    /// @notice Update price history with historical benchmark data
-    /// @dev Uses Pyth Benchmarks to fill price history with up to 24 hours of historical data
+    /// @notice Update price history with historical price data
+    /// @dev Uses Pyth parsePriceFeedUpdates to fill price history with up to 24 hours of historical data
     /// @param pythUpdateData Array of price update data containing historical prices
     /// @param timestamps Array of timestamps for which to retrieve prices (must be in ascending order)
     function updateHistoricalPrices(
         bytes[] calldata pythUpdateData,
         uint64[] calldata timestamps
     ) external payable {
-        if (pythUpdateData.length == 0 || timestamps.length == 0) revert InvalidAmount();
-        if (timestamps.length > MAX_PRICE_POINTS) revert InvalidAmount();
+        if (pythUpdateData.length == 0 || timestamps.length == 0) revert EmptyPriceUpdateData();
+        if (timestamps.length > MAX_PRICE_POINTS) revert TooManyPriceUpdates();
         
         // Validate timestamps
         _validateTimestamps(timestamps);
@@ -264,7 +361,7 @@ contract CustodialVault is ReentrancyGuardTransient {
         uint64 previousTimestamp = 0;
         
         for (uint256 i = 0; i < timestamps.length; i++) {
-            if (timestamps[i] < cutoffTime || timestamps[i] > currentTime) revert InvalidAmount();
+            if (timestamps[i] < cutoffTime || timestamps[i] > currentTime) revert TimestampOutOfRange();
             if (timestamps[i] <= previousTimestamp) revert InvalidPriceHistory();
             previousTimestamp = timestamps[i];
         }
@@ -295,15 +392,28 @@ contract CustodialVault is ReentrancyGuardTransient {
         uint64 minTime = timestamp > 60 ? timestamp - 60 : 0;
         uint64 maxTime = timestamp < type(uint64).max - 60 ? timestamp + 60 : type(uint64).max;
         
-        IPyth.Price[] memory prices = PYTH_ORACLE.parsePriceFeedUpdatesUnique{value: fee}(
+        IPyth.PriceFeed[] memory priceFeeds = PYTH_ORACLE.parsePriceFeedUpdates{value: fee}(
             pythUpdateData,
             priceIds,
             minTime,
             maxTime
         );
         
-        if (prices.length > 0) {
-            uint256 price = _convertPythPrice(prices[0]);
+        if (priceFeeds.length > 0) {
+            IPyth.Price memory priceData = priceFeeds[0].price;
+            
+            // Validate confidence interval
+            if (priceData.price > 0) {
+                uint256 priceAbs = uint256(uint64(priceData.price));
+                uint256 confidence = uint256(priceData.conf);
+                
+                // Check if confidence is within acceptable range (e.g., 3% of price)
+                if (confidence * BASIS_POINTS > priceAbs * MAX_CONFIDENCE_BPS) {
+                    revert ExcessiveConfidenceInterval();
+                }
+            }
+            
+            uint256 price = _convertPythPrice(priceData);
             
             priceHistory[priceHistoryIndex] = PricePoint({
                 price: uint192(price),
@@ -327,6 +437,17 @@ contract CustodialVault is ReentrancyGuardTransient {
         if (pythPrice.publishTime > 0 && block.timestamp > pythPrice.publishTime 
             && block.timestamp - pythPrice.publishTime > MAX_PRICE_AGE) {
             return;
+        }
+
+        // Validate confidence interval
+        if (pythPrice.price > 0) {
+            uint256 priceAbs = uint256(uint64(pythPrice.price));
+            uint256 confidence = uint256(pythPrice.conf);
+            
+            // Skip if confidence is too high (more than 3% of price)
+            if (confidence * BASIS_POINTS > priceAbs * MAX_CONFIDENCE_BPS) {
+                return;
+            }
         }
 
         // Update price history for TWAP
@@ -486,15 +607,16 @@ contract CustodialVault is ReentrancyGuardTransient {
         external
         view
         returns (
-            uint256 initPrice,
+            uint256 liqPrice,
             uint256 tokenAmount,
             uint256 lockEnd,
+            uint256 depositTimestamp,
+            bool isStarted,
             bool isWithdrawn,
-            bool hasLenderApproval,
             uint256 currentBalance
         )
     {
-        return (initialPrice, totalTokenAmount, lockEndTime, withdrawn, lenderApproval, address(this).balance);
+        return (liquidationPrice, totalTokenAmount, lockEndTime, depositTime, started, withdrawn, address(this).balance);
     }
 
     /// @notice Get current TWAP price
@@ -518,46 +640,116 @@ contract CustodialVault is ReentrancyGuardTransient {
         return block.timestamp;
     }
 
-    /// @notice Allows foundation to propose an increase to the price drop threshold
-    /// @dev Can only increase the threshold (make it harder to withdraw), not decrease
-    /// @param newThreshold The new threshold in basis points (e.g., 6000 = 60%)
-    function proposeThresholdIncrease(uint256 newThreshold) external {
-        if (msg.sender != foundation) revert NotAuthorized();
-        if (withdrawn) revert AlreadyWithdrawn();
-        if (thresholdProposalActive) revert ProposalAlreadyActive();
+    /// @notice Propose a new liquidation price (borrower only)
+    /// @param newLiquidationPrice The proposed new liquidation price
+    function proposeLiquidationPrice(uint256 newLiquidationPrice) external {
+        if (msg.sender != borrower) revert NotAuthorized();
+        if (newLiquidationPrice == 0) revert InvalidAmount();
+        if (liquidationPriceProposalActive) revert ProposalAlreadyActive();
         
-        // Validate new threshold
-        if (newThreshold <= priceDropThreshold) revert InvalidThreshold(); // Must be an increase
-        if (newThreshold > MAX_PRICE_DROP_THRESHOLD) revert InvalidThreshold(); // Cannot exceed max
+        proposedLiquidationPrice = newLiquidationPrice;
+        liquidationPriceProposalActive = true;
         
-        proposedThreshold = newThreshold;
-        thresholdProposalActive = true;
-        
-        emit ThresholdIncreaseProposed(newThreshold, msg.sender);
+        emit LiquidationPriceProposed(liquidationPrice, newLiquidationPrice);
     }
 
-    /// @notice Allows lender to approve the proposed threshold increase
-    function approveThresholdIncrease() external {
+    /// @notice Approve the proposed liquidation price (lender only)
+    function approveLiquidationPrice() external {
         if (msg.sender != lender) revert NotAuthorized();
-        if (!thresholdProposalActive) revert NoActiveProposal();
-        if (withdrawn) revert AlreadyWithdrawn();
+        if (!liquidationPriceProposalActive) revert NoActiveProposal();
         
-        uint256 newThreshold = proposedThreshold;
-        priceDropThreshold = newThreshold;
-        thresholdProposalActive = false;
-        proposedThreshold = 0;
+        uint256 oldPrice = liquidationPrice;
+        liquidationPrice = proposedLiquidationPrice;
         
-        emit ThresholdIncreaseApproved(newThreshold, msg.sender);
+        // Reset proposal state
+        proposedLiquidationPrice = 0;
+        liquidationPriceProposalActive = false;
+        
+        // Cancel any active liquidation request if price update makes it invalid
+        if (liquidationRequestActive) {
+            liquidationRequestActive = false;
+            liquidationRequestTime = 0;
+            emit LiquidationCancelled(1); // 1: price update
+        }
+        
+        emit LiquidationPriceUpdated(oldPrice, liquidationPrice);
     }
 
-    /// @notice Allows lender to reject the proposed threshold increase
-    function rejectThresholdIncrease() external {
+    /// @notice Reject the proposed liquidation price (lender only)
+    function rejectLiquidationPrice() external {
         if (msg.sender != lender) revert NotAuthorized();
-        if (!thresholdProposalActive) revert NoActiveProposal();
+        if (!liquidationPriceProposalActive) revert NoActiveProposal();
         
-        thresholdProposalActive = false;
-        proposedThreshold = 0;
+        uint256 rejectedPrice = proposedLiquidationPrice;
         
-        emit ThresholdIncreaseRejected(msg.sender);
+        // Reset proposal state
+        proposedLiquidationPrice = 0;
+        liquidationPriceProposalActive = false;
+        
+        emit LiquidationPriceProposalRejected(rejectedPrice);
     }
+
+    /// @notice Propose an emergency withdrawal (borrower only)
+    /// @param recipient The address to receive the emergency withdrawal
+    function proposeEmergencyWithdrawal(address recipient) external {
+        if (msg.sender != borrower) revert NotAuthorized();
+        if (recipient == address(0)) revert InvalidAddress();
+        if (withdrawn) revert AlreadyWithdrawn();
+        
+        proposedEmergencyRecipient = recipient;
+        emergencyWithdrawalProposed = true;
+        emergencyWithdrawalApproved = false;
+        
+        emit EmergencyWithdrawalProposed(msg.sender, recipient);
+    }
+
+    /// @notice Approve the emergency withdrawal (lender only)
+    function approveEmergencyWithdrawal() external {
+        if (msg.sender != lender) revert NotAuthorized();
+        if (!emergencyWithdrawalProposed) revert NoEmergencyWithdrawalProposed();
+        
+        emergencyWithdrawalApproved = true;
+        
+        emit EmergencyWithdrawalApproved(msg.sender);
+    }
+
+    /// @notice Execute the approved emergency withdrawal (borrower only)
+    function executeEmergencyWithdrawal() external nonReentrant {
+        if (msg.sender != borrower) revert NotAuthorized();
+        if (!emergencyWithdrawalProposed) revert NoEmergencyWithdrawalProposed();
+        if (!emergencyWithdrawalApproved) revert EmergencyWithdrawalNotApproved();
+        if (withdrawn) revert AlreadyWithdrawn();
+        
+        withdrawn = true;
+        address recipient = proposedEmergencyRecipient;
+        uint256 amount = address(this).balance;
+        
+        // Reset emergency withdrawal state
+        proposedEmergencyRecipient = address(0);
+        emergencyWithdrawalProposed = false;
+        emergencyWithdrawalApproved = false;
+        
+        // Cancel any active liquidation request
+        if (liquidationRequestActive) {
+            liquidationRequestActive = false;
+            liquidationRequestTime = 0;
+        }
+        
+        emit EmergencyWithdrawalExecuted(recipient, amount);
+        
+        Address.sendValue(payable(recipient), amount);
+    }
+
+    /// @notice Cancel the emergency withdrawal proposal (borrower or lender)
+    function cancelEmergencyWithdrawal() external {
+        if (msg.sender != borrower && msg.sender != lender) revert NotAuthorized();
+        if (!emergencyWithdrawalProposed) revert NoEmergencyWithdrawalProposed();
+        
+        proposedEmergencyRecipient = address(0);
+        emergencyWithdrawalProposed = false;
+        emergencyWithdrawalApproved = false;
+        
+        emit EmergencyWithdrawalCancelled();
+    }
+
 }

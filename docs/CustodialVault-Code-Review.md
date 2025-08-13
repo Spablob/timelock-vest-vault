@@ -79,18 +79,18 @@ function _validatePriceHistory() internal view
 ### 4. Price Update Mechanism
 
 ```solidity
-function refreshFeedsAndUpdatePrice(bytes[] calldata pythUpdateData) external payable
+function updatePrice() external
 ```
 
 **What it does:**
-- Updates Pyth oracle with fresh price data
 - Records new price in history if ≥1 minute has passed
-- Refunds excess oracle fees
+- Uses existing Pyth oracle price data
+- No fees required as it doesn't update the oracle
 
 **Security:**
 - Anyone can call (keeps prices fresh)
-- Validates oracle fees are paid
 - Only updates once per minute (gas efficient)
+- Relies on oracle being updated through other means
 
 ## Storage Layout & Gas Optimization
 
@@ -121,7 +121,7 @@ uint256 public priceHistoryIndex;      // Current write position
 
 ### 1. Access Control
 - ✅ **Lender-only functions**: `withdrawByLender()`
-- ✅ **Foundation-only functions**: `withdrawByFoundation()`
+- ✅ **Borrower-only functions**: `withdrawByBorrower()`
 - ✅ **Public functions**: Price updates (intentional)
 
 ### 2. Reentrancy Protection
@@ -197,7 +197,7 @@ MAX_PRICE_POINTS = 1440         // 24 hours * 60 minutes ✓
 **Mitigation**: TWAP makes manipulation extremely expensive
 
 ### 4. Approval After Lock
-**Risk**: Lender might not approve foundation withdrawal  
+**Risk**: Lender might not approve borrower withdrawal  
 **Mitigation**: This is intentional - gives lender final control
 
 ## Deployment Verification Checklist
@@ -206,7 +206,7 @@ When reviewing a deployed CustodialVault:
 
 1. **Verify Constructor Parameters**:
    ```solidity
-   foundation     // Correct address?
+   borrower     // Correct address?
    lender         // Your address?
    initialPrice   // Matches agreement?
    totalTokenAmount // Expected amount?
@@ -249,4 +249,4 @@ The CustodialVault implementation is robust and secure for lenders:
 4. **Gas Efficient**: Optimized storage and ring buffer implementation
 5. **Battle-Tested Components**: Uses OpenZeppelin for critical features
 
-The contract successfully balances lender protection with foundation needs while preventing common attack vectors through TWAP pricing and proper access controls.
+The contract successfully balances lender protection with borrower needs while preventing common attack vectors through TWAP pricing and proper access controls.
